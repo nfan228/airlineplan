@@ -1,0 +1,65 @@
+# ===== 外站票雷達 設定檔 =====
+# 修改後直接存檔即可，不需要改程式
+
+currency: twd            # 價格幣別
+home: TPE                # 你實際住的地方（用來估算「飛去外站」的成本、和台北直飛比價）
+months_ahead: 6          # 掃描未來幾個月的出發日期（含本月）
+
+trip_days:               # 只看這個天數範圍內的來回票
+  min: 7
+  max: 30
+
+deal_threshold_pct: 20   # 比該航線「常見價（中位數）」便宜多少 % 以上才算好價
+baseline_window_days: 60 # 用過去幾天累積的價格計算常見價
+min_samples: 30          # 歷史資料少於這個數量時，改用本次抓到的整批價格當基準
+max_deals_in_report: 15  # 每次通知最多列幾筆
+request_delay_sec: 0.7   # 每次呼叫 API 之間的間隔（Travelpayouts 以「每分鐘」限流，遇 429 會自動重試）
+
+# 外站起點
+origins:
+  HKG: 香港
+  BKK: 曼谷
+  ICN: 首爾
+
+# 目的地（可自行增減，用機場 IATA 代碼）
+destinations:
+  北美:
+    LAX: 洛杉磯
+    SFO: 舊金山
+    SEA: 西雅圖
+    JFK: 紐約
+    YVR: 溫哥華
+    YYZ: 多倫多
+    HNL: 檀香山
+  歐洲:
+    LHR: 倫敦
+    CDG: 巴黎
+    FRA: 法蘭克福
+    AMS: 阿姆斯特丹
+    MUC: 慕尼黑
+    ZRH: 蘇黎世
+    VIE: 維也納
+    PRG: 布拉格
+    FCO: 羅馬
+    BCN: 巴塞隆納
+    MAD: 馬德里
+    IST: 伊斯坦堡
+  阿曼:
+    MCT: 馬斯喀特
+  中南美:
+    MEX: 墨西哥城
+    CUN: 坎昆
+    PTY: 巴拿馬城
+    BOG: 波哥大
+    LIM: 利馬
+    GRU: 聖保羅
+    EZE: 布宜諾斯艾利斯
+    SCL: 聖地牙哥
+
+# 台灣籍航空（外站起點搭這些航空，通常會經台北轉機＝典型外站票）
+taiwan_carriers: [CI, BR, JX]
+
+# 用 Google Flights（SerpApi）即時複查好價；需設定 SERPAPI_KEY，沒設就自動略過
+verify:
+  enabled: true
+  max_per_run: 3         # SerpApi 免費額度有限，每次只複查前幾名
