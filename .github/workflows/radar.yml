@@ -32,9 +32,15 @@ jobs:
         run: python flight_radar.py
 
       - name: 保存價格歷史
+        if: always()
         run: |
           git config user.name "flight-radar"
           git config user.email "bot@users.noreply.github.com"
-          git add -f data/prices.db reports/latest.md
-          git diff --staged --quiet || git commit -m "掃描 $(date -u +%Y-%m-%d)"
-          git push
+          git add -f data/prices.db reports/latest.md 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "沒有新資料，略過"
+            exit 0
+          fi
+          git commit -m "掃描 $(date -u +%Y-%m-%d)"
+          git pull --rebase origin main || echo "rebase 略過"
+          git push origin HEAD:main || echo "⚠️ 推送失敗（重跑舊 commit 時屬正常），不影響掃描結果"
