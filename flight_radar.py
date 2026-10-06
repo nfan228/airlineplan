@@ -108,6 +108,8 @@ class OutFare:
     via_home: bool = False            # 航程是否真的經過台北
     stops_out: int = 0
     positioning: float | None = None  # 台北→外站 單程（去開票）
+    home_fare: float | None = None    # 同一批航空、同日期，從台北買要多少（公平的對照組）
+    home_airlines: list = field(default_factory=list)
     four_leg: float | None = None     # 選配：拆成四段單程的參考價
     error: str = ""
 
@@ -119,6 +121,14 @@ class OutFare:
 
     @property
     def saving(self) -> float | None:
+        """跟「同航空、從台北買」相比省多少。這才是公平的比較。"""
+        if self.total is None or self.home_fare is None:
+            return None
+        return self.home_fare - self.total
+
+    @property
+    def saving_vs_cheapest(self) -> float | None:
+        """跟「不限航空、市場最低價」相比。通常會輸，但值得知道。"""
         if self.total is None:
             return None
         return self.cand.q.price - self.total
@@ -339,8 +349,14 @@ def build_report(cfg, names, run_date, fares, candidates, skipped, scanned,
         lines.append(f"  外站來回 {fmt(f.price)}"
                      + (f" ＋ 台北→{names[o]}單程 {fmt(f.positioning)}（去開票）"
                         f" ＝ {fmt(f.total)}" if f.positioning else ""))
-        lines.append(f"  台北直接來回同日期 {fmt(q.price)}"
-                     f" → {'省' if f.saving > 0 else '反而貴'} {fmt(abs(f.saving))}")
+        if f.home_fare:
+            lines.append(f"  同航空從台北買 {fmt(f.home_fare)}"
+                         f" → {'省' if f.saving > 0 else '反而貴'} {fmt(abs(f.saving))}")
+        else:
+            lines.append("  查不到同航空從台北買的價格，無法公平比較")
+        lines.append(f"  （不限航空的市場最低 {fmt(q.price)}"
+                     f"／{names.get(q.airline, q.airline) or '?'}，"
+                     f"{'外站票仍便宜' if (f.saving_vs_cheapest or 0) > 0 else '這個更便宜'}）")
         if f.four_leg:
             lines.append(f"  （拆成四段單程的參考價 {fmt(f.four_leg)}，分段計價本來就貴很多）")
         lines.append("")
@@ -512,8 +528,10 @@ def main():
         want_four_leg = mc.get("four_leg_check", False)
         pos_cache, seen_dest = {}, set()
         today = dt.datetime.now(TW).date()
+        per_dest = 1 + len(cfg["outstations"])   # 1 次對照組 ＋ 每個外站各 1 次
         for cand in candidates:
-            if budget <= 0:
+            # 額度不夠跑完一個目的地的整組就停，避免只查到一半沒有對照組
+            if budget < per_dest:
                 break
             # 同一個目的地只查一次，把有限的額度分散到不同城市，
             # 不然前幾名常常是同一個目的地的不同月份，額度全砸在一個地方
@@ -524,6 +542,21 @@ def main():
             if d_out <= today:
                 continue
             seen_dest.add(cand.q.dest)
+
+            # 對照組：同一批航空、同日期，從台北買要多少。
+            # 第一階段抓到的市場最低價常常是外籍轉機票，拿來比不公平。
+            budget -= 1
+            if args.demo:
+                hp, ha, _, _, _ = fake_osrt(serp_key, home, cand.q.dest, d_out.isoformat(),
+                                            d_ret.isoformat(), carriers, home, cur,
+                                            cand.q.price * 2.6)
+            else:
+                hp, ha, _, _, _ = serp_outstation_roundtrip(
+                    serp_key, home, cand.q.dest, d_out.isoformat(), d_ret.isoformat(),
+                    carriers, home, cur)
+                time.sleep(delay)
+            log(f"對照組 {home}⇄{cand.q.dest}（{'／'.join(ha) or '?'}）: {hp}")
+
             for o in cfg["outstations"]:
                 if budget <= 0:
                     break
@@ -538,7 +571,8 @@ def main():
                         carriers, home, cur)
                     time.sleep(delay)
                 f = OutFare(cand, o, d_out.isoformat(), d_ret.isoformat(),
-                            price, airlines, via, stops, None, None, err)
+                            price, airlines, via, stops,
+                            None, hp, ha, None, err)
                 if price is not None:
                     key = (o, d_out.strftime("%Y-%m"))
                     if key not in pos_cache:
