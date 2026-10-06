@@ -25,6 +25,8 @@ jobs:
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python flight_radar.py
