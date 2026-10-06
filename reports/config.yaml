@@ -1,0 +1,68 @@
+# ===== 外站票雷達 設定檔 v2 =====
+# 目標：香港 → 台北（中停）→ 歐美 → 台北（中停）→ 香港 的四腿票
+# 修改後直接存檔即可，不需要改程式
+
+currency: twd
+home: TPE                # 你住的地方＝中停點
+months_ahead: 6          # 掃描未來幾個月
+
+trip_days:               # 歐美段去回程間隔幾天
+  min: 7
+  max: 30
+
+# 外站＝票的起訖點。程式會分別試算從哪個外站開票最划算
+outstations:
+  HKG: 香港
+  BKK: 曼谷
+  ICN: 首爾
+
+# 可以中停台北的航空。必須同時經營「外站⇄台北」和「台北⇄目的地」才組得出四腿票
+stopover_carriers:
+  BR: 長榮
+  CI: 華航
+  JX: 星宇
+
+# 台北中停幾天（第一段落地台北後待幾天才飛歐美；回到台北後待幾天才飛回外站）
+stopover:
+  days_before: 2
+  days_after: 2
+
+# 目的地。程式會自動確認「台北有沒有直飛」，沒直飛的會自動略過，
+# 所以這裡可以放寬一點，不用自己維護航線表
+destinations:
+  歐洲:
+    VIE: 維也納
+    AMS: 阿姆斯特丹
+    FRA: 法蘭克福
+    MUC: 慕尼黑
+    CDG: 巴黎
+    LHR: 倫敦
+    FCO: 羅馬
+    MXP: 米蘭
+    PRG: 布拉格
+    IST: 伊斯坦堡
+  北美:
+    LAX: 洛杉磯
+    SFO: 舊金山
+    SEA: 西雅圖
+    ONT: 安大略
+    JFK: 紐約
+    EWR: 紐華克
+    YVR: 溫哥華
+    IAH: 休士頓
+    ORD: 芝加哥
+  大洋洲:
+    BNE: 布里斯本
+    SYD: 雪梨
+
+deal_threshold_pct: 15   # 台北直飛票比常見價便宜多少 % 才列為候選
+baseline_window_days: 60
+min_samples: 30
+max_deals_in_report: 12
+request_delay_sec: 0.7
+
+# 四腿票實際報價（Google Flights 多段查詢，需要 SERPAPI_KEY）
+multicity:
+  enabled: true
+  max_per_run: 3         # 每次執行最多查幾組。免費額度約每月 100 次，一天 3 組剛好
+  nonstop_only: true     # 四段全部只要直飛
