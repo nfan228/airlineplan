@@ -55,14 +55,23 @@ destinations:
     BNE: 布里斯本
     SYD: 雪梨
 
-deal_threshold_pct: 15   # 台北直飛票比常見價便宜多少 % 才列為候選
+# 第一階段的資料抓取方式
+# Travelpayouts 的快取資料裡標記為「直飛」的筆數很少，開 direct_only 會讓資料幾乎抓不到。
+# 所以預設是全抓，再用「只留台灣籍航空」來過濾——因為能中停台北的本來就只有這幾家。
+direct_only: false
+require_taiwan_carrier: true
+
+deal_threshold_pct: 12   # 台北來回票比常見價便宜多少 % 才列為候選
 baseline_window_days: 60
-min_samples: 30
+min_samples: 20
+# 沒有任何一筆達到上面的門檻時，改用「單純最便宜的那幾筆」當候選，
+# 這樣第二階段才有東西可查。剛開始沒有歷史資料時特別重要。
+fallback_to_cheapest: true
 max_deals_in_report: 12
 request_delay_sec: 0.7
 
 # 四腿票實際報價（Google Flights 多段查詢，需要 SERPAPI_KEY）
 multicity:
   enabled: true
-  max_per_run: 3         # 每次執行最多查幾組。免費額度約每月 100 次，一天 3 組剛好
+  max_per_run: 6         # 每次執行最多查幾組。SerpApi 免費額度每月 250 次，一天 6 組＝每月 180 次
   nonstop_only: true     # 四段全部只要直飛

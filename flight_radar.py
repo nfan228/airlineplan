@@ -79,11 +79,14 @@ class Candidate:
     """第一階段挑出來、值得進一步查四腿票的目的地與日期"""
     q: Quote
     region: str
-    baseline: float
+    baseline: float | None
     baseline_src: str
+    fallback: bool = False       # 沒達到折扣門檻、只是「目前最便宜」
 
     @property
     def pct_below(self) -> float:
+        if not self.baseline:
+            return 0.0
         return (1 - self.q.price / self.baseline) * 100
 
 
@@ -242,7 +245,7 @@ def baseline_for(db, dest, run_date, window, min_samples, batch):
         if len(days) <= 1:
             return statistics.median(rows), f"僅今日 {len(rows)} 筆，尚無歷史"
         return statistics.median(rows), f"{len(days)} 天 / {len(rows)} 筆"
-    if len(batch) >= 5:
+    if len(batch) >= 3:
         return statistics.median(q.price for q in batch), f"本次 {len(batch)} 筆"
     return None, ""
 
@@ -288,10 +291,15 @@ def fake_sources():
 
 # ---------------- 報告 ----------------
 
-def build_report(cfg, names, run_date, four_legs, candidates, skipped, scanned, has_serp):
+def build_report(cfg, names, run_date, four_legs, candidates, skipped, scanned,
+                 has_serp, fallback_used=False):
     st = cfg["stopover"]
     lines = [f"✈️ 外站票雷達 {run_date}",
-             f"掃描 {scanned} 個目的地的台北直飛來回票，挑出 {len(candidates)} 個便宜候選", ""]
+             f"掃描 {scanned} 個目的地的台北來回票，挑出 {len(candidates)} 個候選", ""]
+    if fallback_used:
+        lines.append("※ 今天沒有任何一筆低於常見價的門檻，以下改列「目前最便宜」的日期，")
+        lines.append("  讓四腿票查詢還是有東西可比。累積幾天歷史之後折扣判斷才會準。")
+        lines.append("")
 
     if four_legs:
         lines.append("━━━ 四腿外站票實際報價 ━━━")
@@ -321,23 +329,31 @@ def build_report(cfg, names, run_date, four_legs, candidates, skipped, scanned, 
         lines.append("  四腿票的實際票價需要 Google Flights 多段查詢才問得到。")
         lines.append("")
 
-    lines.append("━━━ 台北直飛便宜票（四腿票的候選日期）━━━")
+    lines.append("━━━ 台北來回便宜票（四腿票的候選日期）━━━")
     lines.append("")
     if not candidates:
-        lines.append("今天沒有明顯低於常見價的台北直飛票。")
+        lines.append("今天完全沒抓到資料，請檢查 TP_TOKEN 是否正常。")
         lines.append("")
     for c in candidates:
         q = c.q
         dep, ret = dt.date.fromisoformat(q.depart), dt.date.fromisoformat(q.ret)
-        lines.append(f"🔥 台北 → {names[q.dest]} {q.dest}（{c.region}）{q.airline or '?'} 直飛")
+        lines.append(f"🔥 台北 → {names[q.dest]} {q.dest}（{c.region}）"
+                     f"{names.get(q.airline, q.airline) or '?'}")
         lines.append(f"  {dep:%m/%d}–{ret:%m/%d}（{q.days}天）台北來回 {fmt(q.price)}")
-        lines.append(f"  比常見價 {fmt(c.baseline)} 便宜 {c.pct_below:.0f}%（基準：{c.baseline_src}）")
+        if c.baseline and not c.fallback:
+            lines.append(f"  比常見價 {fmt(c.baseline)} 便宜 "
+                         f"{c.pct_below:.0f}%（基準：{c.baseline_src}）")
+        elif c.baseline:
+            lines.append(f"  目前常見價 {fmt(c.baseline)}（基準：{c.baseline_src}）")
+        else:
+            lines.append("  資料太少，還算不出常見價")
         if q.link:
             lines.append(f"  {q.link}")
         lines.append("")
 
     if skipped:
-        lines.append(f"略過（查無台北直飛）：{'、'.join(names[d] for d in skipped)}")
+        lines.append(f"略過（{'台灣籍航空' if cfg.get('require_taiwan_carrier', True) else ''}"
+                     f"查無資料）：{'、'.join(names[d] for d in skipped)}")
         lines.append("")
     lines.append("※ 價格為快取價與搜尋結果，訂票前請到航空公司官網以「多個城市」重新確認。")
     lines.append("※ 外站票的中停天數、改票退票規定依票價條件而定，開票前請先看清楚。")
@@ -417,25 +433,29 @@ def main():
         for m in mlist:
             qs += (fake_rt(token, home, dcode, m, cur, delay, region=region_of[dcode])
                    if args.demo else
-                   tp_roundtrips(token, home, dcode, m, cur, delay, direct=True))
+                   tp_roundtrips(token, home, dcode, m, cur, delay,
+                                 direct=cfg.get("direct_only", False)))
         qs = [q for q in qs if tmin <= q.days <= tmax]
+        if cfg.get("require_taiwan_carrier", True):
+            qs = [q for q in qs if q.airline in carriers]
         if not qs:
             skipped.append(dcode)
-            log(f"{home}->{dcode}: 查無直飛，略過")
+            log(f"{home}->{dcode}: 查無資料，略過")
             continue
         batches[dcode] = qs
         db.execute("DELETE FROM tpe_direct WHERE run_date=? AND dest=?", (run_date, dcode))
         db.executemany("INSERT INTO tpe_direct VALUES(?,?,?,?,?,?)",
                        [(run_date, q.dest, q.depart, q.ret, q.price, q.airline) for q in qs])
-        log(f"{home}->{dcode}: {len(qs)} 筆直飛")
+        log(f"{home}->{dcode}: {len(qs)} 筆")
     db.commit()
 
     # ---- 挑候選 ----
     thr = cfg["deal_threshold_pct"] / 100
-    candidates = []
+    candidates, bases = [], {}
     for dcode, qs in batches.items():
         base, src = baseline_for(db, dcode, run_date, cfg["baseline_window_days"],
                                  cfg["min_samples"], qs)
+        bases[dcode] = (base, src)
         if not base:
             continue
         best_per_month = {}
@@ -446,8 +466,22 @@ def main():
         for q in best_per_month.values():
             candidates.append(Candidate(q, region_of[dcode], base, src))
     candidates.sort(key=lambda c: -c.pct_below)
+
+    # 沒有任何一筆達到折扣門檻時（剛開始沒歷史資料時很常見），
+    # 改用「每個目的地目前最便宜的那一筆」當候選，讓第二階段還是有東西可查。
+    fallback_used = False
+    if not candidates and cfg.get("fallback_to_cheapest", True):
+        fallback_used = True
+        for dcode, qs in batches.items():
+            q = min(qs, key=lambda x: x.price)
+            base, src = bases.get(dcode, (None, ""))
+            candidates.append(Candidate(q, region_of[dcode], base, src, fallback=True))
+        # 用「相對於自己航線常見價的折扣」排序，比單純比絕對票價有意義，
+        # 不然永遠只會挑到票價最低的那幾個目的地
+        candidates.sort(key=lambda c: (-c.pct_below, c.q.price))
+
     candidates = candidates[: cfg.get("max_deals_in_report", 12)]
-    log(f"候選 {len(candidates)} 筆")
+    log(f"候選 {len(candidates)} 筆" + ("（最便宜遞補）" if fallback_used else ""))
 
     # ---- 第二階段：四腿票實際報價 ----
     four_legs = []
@@ -500,7 +534,7 @@ def main():
         four_legs.sort(key=lambda f: (f.saving is None, -(f.saving or 0)))
 
     report = build_report(cfg, names, run_date, four_legs, candidates,
-                          skipped, len(batches), has_serp)
+                          skipped, len(batches), has_serp, fallback_used)
     out = BASE / "reports"
     out.mkdir(exist_ok=True)
     (out / ("demo.md" if args.demo else "latest.md")).write_text(report, encoding="utf-8")
