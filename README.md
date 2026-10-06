@@ -65,12 +65,14 @@ python flight_radar.py --demo
 | 環境變數 | 用途 | 必要性 |
 |---|---|---|
 | `TP_TOKEN` | Travelpayouts，第一階段的價格來源 | **必填**。免費，[個人資料頁](https://app.travelpayouts.com/profile/api-token)取得 |
-| `SERPAPI_KEY` | [SerpApi](https://serpapi.com)，第二階段的四腿票報價 | **這是核心功能**。免費額度約每月 100 次查詢 |
-| `TELEGRAM_BOT_TOKEN` | 推播到手機 | 選填 |
+| `SERPAPI_KEY` | [SerpApi](https://serpapi.com)，第二階段的外站票報價 | **這是核心功能**。免費方案每月 250 次查詢，不用信用卡，金鑰在 [manage-api-key](https://serpapi.com/manage-api-key) |
+| `LINE_TOKEN` | 推播到 LINE | 選填，設定方式見下方 |
+| `LINE_USER_ID` | 只推給自己（不設就用 broadcast） | 選填 |
+| `TELEGRAM_BOT_TOKEN` | 推播到 Telegram | 選填 |
 | `TELEGRAM_CHAT_ID` | 同上 | 選填 |
 
-沒設 `SERPAPI_KEY` 的話程式一樣會跑，但只會告訴你「台北直飛哪天便宜」，
-查不到四腿票的實際票價——而那才是你要的東西。
+沒設 `SERPAPI_KEY` 的話程式一樣會跑，但只會告訴你「台北哪天便宜」，
+查不到外站票的實際票價——而那才是你要的東西。
 
 ### 4. 執行
 
@@ -82,22 +84,59 @@ python flight_radar.py
 
 ---
 
+## 推播到 LINE
+
+舊的 LINE Notify 已於 2025 年 3 月底停止服務，現在要改用 Messaging API。
+設定稍微麻煩，但只要做一次。台灣的免費方案每月 200 則，自用綽綽有餘
+（這支程式一天最多推一兩則）。
+
+1. 到 [LINE Developers](https://developers.line.biz/console/) 用你的 LINE 帳號登入
+2. 建立一個 **Provider**（名字隨便取，例如 `personal`）
+3. 在它底下建立一個 **Messaging API channel**，這會同時開一個 LINE 官方帳號
+4. 進入該 channel 的 **Messaging API** 分頁：
+   - 拉到最下面，**Channel access token (long-lived)** 按 Issue，複製那一長串
+   - 上面有個 QR code，用手機 LINE 掃描，**把這個官方帳號加為好友**（這步不能漏，
+     沒加好友的話推播會成功送出但你收不到）
+5. 同一分頁把 **Auto-reply messages** 關掉，免得它每次都回罐頭訊息
+
+然後把那串 token 設成 `LINE_TOKEN` 就好。
+
+只設 `LINE_TOKEN` 的話程式用的是 **broadcast**，發給所有加這個官方帳號的好友——
+自用情境下就是你一個人，省去查自己 userId 的麻煩。
+
+如果這個官方帳號還有別人加好友、你想只發給自己，就到 channel 的 **Basic settings**
+分頁最下面找 **Your user ID**，額外設定 `LINE_USER_ID`，程式會改成點對點推播。
+
+LINE 和 Telegram 兩邊都設定的話會同時推。
+
+### 通知門檻
+
+`config.yaml` 裡的 `notify_min_saving` 預設 **3000**，意思是省不到三千就不吵你。
+省一兩千的機會其實不值得特地飛去外站開票，光住宿和時間就吃掉了。
+想看到所有結果就設 0，但會很吵。
+
+不管有沒有推播，完整報告都會寫進 `reports/latest.md`。
+
+---
+
 ## SerpApi 額度要怎麼用
 
-免費方案每月約 100 次查詢，所以 `config.yaml` 裡的 `multicity.max_per_run` 預設是 **3**，
-一天 3 次、一個月 90 次，剛好用完不超。
+免費方案每月 250 次查詢，所以 `config.yaml` 裡的 `multicity.max_per_run` 預設是 **6**，
+一天 6 次、一個月 180 次，留一點餘裕給你手動測試。
 
-這 3 次怎麼分配：程式會拿**折扣最深的那個目的地**，分別從三個外站各查一次，
-讓你直接看出「從香港、曼谷、首爾開票哪個最便宜」。
+每個目的地會用掉 **1 次對照組 ＋ 每個外站各 1 次** ＝ 目前共 4 次。
 
-想一次看更多目的地，就把 `max_per_run` 調大，但要注意額度：
+對照組那一次很重要：它查的是「同一批航空、同日期、從台北買」要多少。
+第一階段抓到的市場最低價常常是外籍轉機票（經上海、伊斯坦堡那種），
+拿那個去跟長榮的外站票比並不公平，會讓外站票永遠看起來很爛。
 
 | max_per_run | 每天覆蓋 | 每月用量 |
 |---|---|---|
-| 3（預設） | 1 個目的地 × 3 個外站 | 約 90 次 |
-| 9 | 3 個目的地 × 3 個外站 | 約 270 次（要付費方案） |
+| 4（預設） | 1 個目的地 | 約 120 次 |
+| 8 | 2 個目的地 | 約 240 次（貼著上限） |
 
-另一個省額度的做法：把 workflow 的 cron 改成每週跑兩三次，單次 `max_per_run` 就能放大。
+另一個做法：把 workflow 的 cron 改成每週跑兩三次，單次 `max_per_run` 就能放得更大，
+一次看到更多目的地。
 
 ---
 

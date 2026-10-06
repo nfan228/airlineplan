@@ -400,19 +400,52 @@ def build_report(cfg, names, run_date, fares, candidates, skipped, scanned,
     return "\n".join(lines)
 
 
-def send_telegram(token, chat_id, text):
-    chunks, cur = [], ""
+def chunk_text(text, size):
+    """依段落切成不超過 size 的區塊，避免把一筆報價從中間切斷。
+    萬一單一段落本身就超長，再退而求其次按行切，確保不會超過上限被服務端退件。"""
+    blocks = []
     for block in text.split("\n\n"):
-        if len(cur) + len(block) > 3800:
-            chunks.append(cur)
+        while len(block) > size:
+            cut = block.rfind("\n", 0, size)
+            cut = cut if cut > 0 else size
+            blocks.append(block[:cut])
+            block = block[cut:].lstrip("\n")
+        blocks.append(block)
+
+    chunks, cur = [], ""
+    for block in blocks:
+        if cur and len(cur) + len(block) + 2 > size:
+            chunks.append(cur.rstrip())
             cur = ""
         cur += block + "\n\n"
-    chunks.append(cur)
-    for c in chunks:
-        if c.strip():
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          data={"chat_id": chat_id, "text": c,
-                                "disable_web_page_preview": "true"}, timeout=30)
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    return chunks
+
+
+def send_telegram(token, chat_id, text):
+    for c in chunk_text(text, 3800):
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat_id, "text": c,
+                            "disable_web_page_preview": "true"}, timeout=30)
+
+
+def send_line(token, text, user_id=None):
+    """LINE Messaging API。沒給 user_id 就用 broadcast（發給所有加這個官方帳號的好友，
+    自用的話就是你自己），省去查自己 userId 的麻煩。
+    LINE 單則上限 5000 字、一次請求最多 5 則。"""
+    chunks = chunk_text(text, 4500)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    for i in range(0, len(chunks), 5):
+        msgs = [{"type": "text", "text": c} for c in chunks[i:i + 5]]
+        if user_id:
+            url, body = "https://api.line.me/v2/bot/message/push", {"to": user_id,
+                                                                    "messages": msgs}
+        else:
+            url, body = "https://api.line.me/v2/bot/message/broadcast", {"messages": msgs}
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        if r.status_code >= 300:
+            log(f"  ! LINE 推播失敗 {r.status_code}: {r.text[:200]}")
 
 
 # ---------------- 主流程 ----------------
@@ -607,19 +640,26 @@ def main():
     print(report)
 
     tg_token, tg_chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not args.demo and not args.no_notify and tg_token and tg_chat:
+    line_token, line_user = os.environ.get("LINE_TOKEN"), os.environ.get("LINE_USER_ID")
+    if not args.demo and not args.no_notify and (line_token or (tg_token and tg_chat)):
+        floor = cfg.get("notify_min_saving", 0)
         new = []
         for f in fares:
-            if not (f.saving and f.saving > 0 and f.via_home):
+            # 只通知「真的經台北」而且省超過門檻的，省幾百塊的不值得吵你
+            if not (f.saving and f.saving >= floor and f.saving > 0 and f.via_home):
                 continue
             k = f"{f.outstation}-{f.cand.q.dest}-{f.d_out}-{f.d_ret}-{round(f.price, -2):.0f}"
             if not db.execute("SELECT 1 FROM notified WHERE key=?", (k,)).fetchone():
                 new.append(k)
         if new:
-            send_telegram(tg_token, tg_chat, report)
+            if line_token:
+                send_line(line_token, report, line_user)
+                log(f"已推播到 LINE（{len(new)} 筆新的）")
+            if tg_token and tg_chat:
+                send_telegram(tg_token, tg_chat, report)
+                log(f"已推播到 Telegram（{len(new)} 筆新的）")
             db.executemany("INSERT OR IGNORE INTO notified VALUES(?,?)",
                            [(k, run_date) for k in new])
-            log(f"已推播到 Telegram（{len(new)} 筆新的）")
 
     if not args.demo:
         db.execute("DELETE FROM tpe_direct WHERE run_date < ?",
