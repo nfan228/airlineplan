@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-外站票雷達 Flight Radar
-- 從外站（香港/曼谷/首爾…）出發，掃描到北美、歐洲、阿曼、中南美的來回票
-- 價格低於該航線常見價一定比例時，列為好價
-- 自動加上「台北⇄外站」的估算成本，並和台北直接出發比價
-- 可選：用 SerpApi (Google Flights) 即時複查
-- 結果寫入 reports/latest.md，並可推播到 Telegram
+外站票雷達 v2 — 真正的四腿中停票
+
+找的是這種票：
+    香港 → 台北（中停 N 天）→ 巴黎 → 台北（中停 N 天）→ 香港
+由同一家台灣籍航空（長榮／華航／星宇）承運，台北⇄歐美那兩段直飛。
+
+做法分兩階段：
+  第一階段（Travelpayouts，免費，每天全掃）
+      掃「台北 ⇄ 目的地」的直飛來回票，累積價格歷史、算出常見價，
+      挑出目前明顯偏低的目的地與日期。沒有台北直飛的目的地會自動略過。
+  第二階段（SerpApi / Google Flights 多段查詢，有免費額度限制）
+      拿第一階段的前幾名，實際去查四腿票的真實票價，
+      指定只要長榮／華航／星宇、只要直飛，再跟「台北直接來回」比價。
+      另外加上「台北→外站」的單程機票（你得先飛去外站才能開這張票）。
 
 環境變數：
-  TP_TOKEN            Travelpayouts API token（必填，免費申請）
-  SERPAPI_KEY         SerpApi 金鑰（選填，用來即時複查）
+  TP_TOKEN            Travelpayouts API token（必填，免費）
+  SERPAPI_KEY         SerpApi 金鑰（第二階段必填，沒有就只跑第一階段）
   TELEGRAM_BOT_TOKEN  Telegram 機器人 token（選填）
   TELEGRAM_CHAT_ID    Telegram 聊天 ID（選填）
 
 用法：
   python flight_radar.py            # 正式執行
-  python flight_radar.py --demo     # 用假資料試跑，不需任何金鑰、不連網
+  python flight_radar.py --demo     # 用假資料試跑，不需金鑰、不連網
   python flight_radar.py --no-notify
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import random
 import sqlite3
@@ -35,7 +44,7 @@ import yaml
 
 try:
     import requests
-except ImportError:  # demo 模式不需要 requests
+except ImportError:          # demo 模式不需要
     requests = None
 
 BASE = Path(__file__).resolve().parent
@@ -44,16 +53,16 @@ SERP_URL = "https://serpapi.com/search.json"
 TW = dt.timezone(dt.timedelta(hours=8))
 
 
+# ---------------- 資料結構 ----------------
+
 @dataclass
 class Quote:
-    origin: str
+    """台北 ⇄ 目的地 的一筆直飛來回報價"""
     dest: str
     depart: str
     ret: str
     price: float
     airline: str = ""
-    transfers_out: int = 0
-    transfers_back: int = 0
     link: str = ""
 
     @property
@@ -66,37 +75,57 @@ class Quote:
 
 
 @dataclass
-class Deal:
+class Candidate:
+    """第一階段挑出來、值得進一步查四腿票的目的地與日期"""
     q: Quote
     region: str
     baseline: float
     baseline_src: str
-    positioning: float | None = None
-    tpe_price: float | None = None
-    live_price: float | None = None
-    typical_range: list | None = None
-    price_level: str | None = None
-    notes: list = field(default_factory=list)
 
     @property
     def pct_below(self) -> float:
         return (1 - self.q.price / self.baseline) * 100
 
+
+@dataclass
+class FourLeg:
+    """第二階段查到的四腿票實際報價"""
+    cand: Candidate
+    outstation: str
+    dates: list                  # [D1, D2, D3, D4]
+    price: float | None = None
+    airlines: list = field(default_factory=list)
+    all_nonstop: bool = True
+    positioning: float | None = None   # 台北→外站 單程（去開票）
+    error: str = ""
+
     @property
     def total(self) -> float | None:
-        return self.q.price + self.positioning if self.positioning else None
+        if self.price is None:
+            return None
+        return self.price + (self.positioning or 0)
+
+    @property
+    def saving(self) -> float | None:
+        if self.total is None:
+            return None
+        return self.cand.q.price - self.total
 
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-# ---------------- 資料來源 ----------------
+def fmt(n):
+    return f"NT${n:,.0f}"
+
+
+# ---------------- 第一階段：Travelpayouts ----------------
 
 def _get_json(url, params, tries=3):
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=40)
+            r = requests.get(url, params=params, timeout=60)
             if r.status_code == 429:
                 time.sleep(5 * (i + 1))
                 continue
@@ -104,20 +133,20 @@ def _get_json(url, params, tries=3):
             return r.json()
         except Exception as e:  # noqa: BLE001
             if i == tries - 1:
-                log(f"  ! 請求失敗 {params.get('origin', '')}->{params.get('destination', '')}: {e}")
+                log(f"  ! 請求失敗: {e}")
                 return None
             time.sleep(3)
     return None
 
 
-def fetch_travelpayouts(token, origin, dest, month, currency, delay):
-    params = {
+def tp_roundtrips(token, origin, dest, month, currency, delay, direct=True):
+    """台北 ⇄ 目的地 的來回票，預設只要直飛"""
+    js = _get_json(TP_URL, {
         "origin": origin, "destination": dest, "departure_at": month,
-        "one_way": "false", "direct": "false", "sorting": "price",
-        "unique": "false", "currency": currency, "limit": 1000, "page": 1,
+        "one_way": "false", "direct": "true" if direct else "false",
+        "sorting": "price", "currency": currency, "limit": 1000, "page": 1,
         "token": token,
-    }
-    js = _get_json(TP_URL, params)
+    })
     time.sleep(delay)
     out = []
     for d in (js or {}).get("data", []) or []:
@@ -125,54 +154,60 @@ def fetch_travelpayouts(token, origin, dest, month, currency, delay):
         if not dep or not ret or not d.get("price"):
             continue
         link = d.get("link") or ""
-        out.append(Quote(origin, dest, dep, ret, float(d["price"]), d.get("airline", ""),
-                         int(d.get("transfers") or 0), int(d.get("return_transfers") or 0),
+        out.append(Quote(dest, dep, ret, float(d["price"]), d.get("airline", ""),
                          f"https://www.aviasales.com{link}" if link else ""))
     return out
 
 
-def fake_fetcher():
-    """Demo 用：產生看起來合理的假價格"""
-    rng = random.Random(42)
-    base = {"北美": 26000, "歐洲": 30000, "阿曼": 22000, "中南美": 42000}
-
-    def f(token, origin, dest, month, currency, delay, region=None):
-        if region is None:  # 台北⇄外站
-            center = {"HKG": 4500, "BKK": 7000, "ICN": 7500}.get(dest, 6000)
-        else:
-            center = base[region] * (1.15 if origin == "TPE" else 1.0)
-        y, m = map(int, month.split("-"))
-        out = []
-        for _ in range(25):
-            day = rng.randint(1, 28)
-            dep = dt.date(y, m, day)
-            ret = dep + dt.timedelta(days=rng.randint(5, 35))
-            p = center * rng.uniform(0.85, 1.25)
-            if rng.random() < 0.04:
-                p = center * rng.uniform(0.55, 0.75)  # 偶爾出現好價
-            out.append(Quote(origin, dest, dep.isoformat(), ret.isoformat(), round(p, -2),
-                             rng.choice(["CX", "TG", "KE", "CI", "BR", "EK", "QR", "TK"]),
-                             rng.randint(0, 2), rng.randint(0, 2), ""))
-        return out
-    return f
+def tp_oneway_min(token, origin, dest, month, currency, delay):
+    """台北 → 外站 的單程最低價（你得先飛過去才能開那張票）"""
+    js = _get_json(TP_URL, {
+        "origin": origin, "destination": dest, "departure_at": month,
+        "one_way": "true", "direct": "false", "sorting": "price",
+        "currency": currency, "limit": 200, "page": 1, "token": token,
+    })
+    time.sleep(delay)
+    prices = [float(d["price"]) for d in (js or {}).get("data", []) or [] if d.get("price")]
+    return min(prices) if prices else None
 
 
-def serpapi_verify(key, deal: Deal, currency):
-    q = deal.q
+# ---------------- 第二階段：SerpApi 多段查詢 ----------------
+
+def serp_multicity(key, legs, carriers, nonstop, currency):
+    """legs = [(from, to, date), ...]　回傳 (價格, [航空公司], 是否全程直飛, 錯誤訊息)"""
     params = {
-        "engine": "google_flights", "departure_id": q.origin, "arrival_id": q.dest,
-        "outbound_date": q.depart, "return_date": q.ret, "type": "1",
-        "currency": currency.upper(), "hl": "zh-TW", "gl": "tw", "api_key": key,
+        "engine": "google_flights",
+        "type": "3",                                   # 3 = 多個城市
+        "multi_city_json": json.dumps(
+            [{"departure_id": a, "arrival_id": b, "date": d} for a, b, d in legs]),
+        "include_airlines": ",".join(carriers),
+        "currency": currency.upper(),
+        "hl": "zh-TW", "gl": "tw",
+        "api_key": key,
     }
+    if nonstop:
+        params["stops"] = "1"                          # 1 = 只要直飛
+
     js = _get_json(SERP_URL, params, tries=2)
     if not js:
-        return
-    flights = (js.get("best_flights") or []) + (js.get("other_flights") or [])
-    prices = [f["price"] for f in flights if isinstance(f.get("price"), (int, float))]
-    deal.live_price = min(prices) if prices else None
-    pi = js.get("price_insights") or {}
-    deal.typical_range = pi.get("typical_price_range")
-    deal.price_level = pi.get("price_level")
+        return None, [], True, "查詢失敗"
+    if js.get("error"):
+        return None, [], True, str(js["error"])
+
+    options = (js.get("best_flights") or []) + (js.get("other_flights") or [])
+    options = [o for o in options if isinstance(o.get("price"), (int, float))]
+    if not options:
+        return None, [], True, "查無符合條件的組合"
+
+    best = min(options, key=lambda o: o["price"])
+    segs = best.get("flights") or []
+    airlines = []
+    for s in segs:
+        a = s.get("airline")
+        if a and a not in airlines:
+            airlines.append(a)
+    # 四段行程若中間有轉機，segments 會多於 4 段
+    return float(best["price"]), airlines, len(segs) <= len(legs), ""
 
 
 # ---------------- 資料庫 ----------------
@@ -181,31 +216,26 @@ def open_db(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS quotes(
-            run_date TEXT, origin TEXT, dest TEXT, depart TEXT, ret TEXT,
-            price REAL, airline TEXT, transfers_out INT, transfers_back INT);
-        CREATE INDEX IF NOT EXISTS idx_route ON quotes(origin, dest, run_date);
+        CREATE TABLE IF NOT EXISTS tpe_direct(
+            run_date TEXT, dest TEXT, depart TEXT, ret TEXT,
+            price REAL, airline TEXT);
+        CREATE INDEX IF NOT EXISTS idx_tpe ON tpe_direct(dest, run_date);
+        CREATE TABLE IF NOT EXISTS fourleg(
+            run_date TEXT, outstation TEXT, dest TEXT,
+            d1 TEXT, d2 TEXT, d3 TEXT, d4 TEXT,
+            price REAL, airlines TEXT, tpe_rt REAL, positioning REAL);
         CREATE TABLE IF NOT EXISTS notified(key TEXT PRIMARY KEY, run_date TEXT);
     """)
     return db
 
 
-def save_quotes(db, run_date, quotes):
-    db.execute("DELETE FROM quotes WHERE run_date=? AND origin=? AND dest=?",
-               (run_date, quotes[0].origin, quotes[0].dest)) if quotes else None
-    db.executemany("INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)",
-                   [(run_date, q.origin, q.dest, q.depart, q.ret, q.price, q.airline,
-                     q.transfers_out, q.transfers_back) for q in quotes])
-
-
-def baseline_for(db, origin, dest, run_date, window, min_samples, batch):
-    """回傳 (常見價, 說明)。常見價＝中位數。
-    累積天數越多越可靠，說明文字會如實標示目前是靠幾天的資料。"""
+def baseline_for(db, dest, run_date, window, min_samples, batch):
+    """常見價＝中位數。說明文字會如實標示目前累積了幾天的資料"""
     since = (dt.date.fromisoformat(run_date) - dt.timedelta(days=window)).isoformat()
     rows, days = [], set()
     for price, rd in db.execute(
-            "SELECT price, run_date FROM quotes WHERE origin=? AND dest=? AND run_date>=?",
-            (origin, dest, since)):
+            "SELECT price, run_date FROM tpe_direct WHERE dest=? AND run_date>=?",
+            (dest, since)):
         rows.append(price)
         days.add(rd)
     if len(rows) >= min_samples:
@@ -215,6 +245,118 @@ def baseline_for(db, origin, dest, run_date, window, min_samples, batch):
     if len(batch) >= 5:
         return statistics.median(q.price for q in batch), f"本次 {len(batch)} 筆"
     return None, ""
+
+
+# ---------------- Demo 假資料 ----------------
+
+def fake_sources():
+    rng = random.Random(7)
+    # 哪些目的地「有台北直飛」——用來驗證自動略過的邏輯
+    nonstop = {"VIE", "AMS", "FRA", "MUC", "CDG", "LHR", "FCO", "MXP", "PRG",
+               "LAX", "SFO", "SEA", "ONT", "JFK", "EWR", "YVR", "IAH", "ORD", "BNE"}
+    center = {"歐洲": 34000, "北美": 29000, "大洋洲": 26000}
+
+    def rt(token, origin, dest, month, currency, delay, direct=True, region=None):
+        if dest not in nonstop:
+            return []
+        y, m = map(int, month.split("-"))
+        c = center.get(region, 30000)
+        out = []
+        for _ in range(22):
+            dep = dt.date(y, m, rng.randint(1, 28))
+            ret = dep + dt.timedelta(days=rng.randint(6, 32))
+            p = c * rng.uniform(0.88, 1.3)
+            if rng.random() < 0.06:
+                p = c * rng.uniform(0.62, 0.8)
+            out.append(Quote(dest, dep.isoformat(), ret.isoformat(), round(p, -2),
+                             rng.choice(["CI", "BR", "JX"])))
+        return out
+
+    def ow(token, origin, dest, month, currency, delay):
+        return round({"HKG": 3400, "BKK": 5200, "ICN": 5600}.get(dest, 5000)
+                     * rng.uniform(0.8, 1.3), -2)
+
+    def mc(key, legs, carriers, nonstop_flag, currency, tpe_rt=30000):
+        # 外站開票通常比台北來回便宜 1～4 成
+        if rng.random() < 0.15:
+            return None, [], True, "查無符合條件的組合"
+        p = round(tpe_rt * rng.uniform(0.6, 0.95), -2)
+        return p, [rng.choice(["長榮航空", "中華航空", "星宇航空"])], True, ""
+
+    return rt, ow, mc
+
+
+# ---------------- 報告 ----------------
+
+def build_report(cfg, names, run_date, four_legs, candidates, skipped, scanned, has_serp):
+    st = cfg["stopover"]
+    lines = [f"✈️ 外站票雷達 {run_date}",
+             f"掃描 {scanned} 個目的地的台北直飛來回票，挑出 {len(candidates)} 個便宜候選", ""]
+
+    if four_legs:
+        lines.append("━━━ 四腿外站票實際報價 ━━━")
+        lines.append("")
+    for f in four_legs:
+        q, o = f.cand.q, f.outstation
+        d1, d2, d3, d4 = f.dates
+        lines.append(f"💺 {names[o]} → 台北（停{st['days_before']}天）→ {names[q.dest]} "
+                     f"→ 台北（停{st['days_after']}天）→ {names[o]}")
+        lines.append(f"  {d1[5:]} {o}→TPE ｜ {d2[5:]} TPE→{q.dest} ｜ "
+                     f"{d3[5:]} {q.dest}→TPE ｜ {d4[5:]} TPE→{o}")
+        if f.price is None:
+            lines.append(f"  查無報價（{f.error}）")
+            lines.append("")
+            continue
+        lines.append(f"  {'／'.join(f.airlines) or '?'}"
+                     + ("，全程直飛" if f.all_nonstop else "，⚠️ 中間有轉機"))
+        lines.append(f"  四腿票 {fmt(f.price)}"
+                     + (f" ＋ 台北→{names[o]}單程 {fmt(f.positioning)}（去開票）"
+                        f" ＝ {fmt(f.total)}" if f.positioning else ""))
+        lines.append(f"  台北直接來回同日期 {fmt(q.price)}"
+                     f" → {'省' if f.saving > 0 else '反而貴'} {fmt(abs(f.saving))}")
+        lines.append("")
+
+    if not has_serp:
+        lines.append("※ 沒有設定 SERPAPI_KEY，所以只跑了第一階段。")
+        lines.append("  四腿票的實際票價需要 Google Flights 多段查詢才問得到。")
+        lines.append("")
+
+    lines.append("━━━ 台北直飛便宜票（四腿票的候選日期）━━━")
+    lines.append("")
+    if not candidates:
+        lines.append("今天沒有明顯低於常見價的台北直飛票。")
+        lines.append("")
+    for c in candidates:
+        q = c.q
+        dep, ret = dt.date.fromisoformat(q.depart), dt.date.fromisoformat(q.ret)
+        lines.append(f"🔥 台北 → {names[q.dest]} {q.dest}（{c.region}）{q.airline or '?'} 直飛")
+        lines.append(f"  {dep:%m/%d}–{ret:%m/%d}（{q.days}天）台北來回 {fmt(q.price)}")
+        lines.append(f"  比常見價 {fmt(c.baseline)} 便宜 {c.pct_below:.0f}%（基準：{c.baseline_src}）")
+        if q.link:
+            lines.append(f"  {q.link}")
+        lines.append("")
+
+    if skipped:
+        lines.append(f"略過（查無台北直飛）：{'、'.join(names[d] for d in skipped)}")
+        lines.append("")
+    lines.append("※ 價格為快取價與搜尋結果，訂票前請到航空公司官網以「多個城市」重新確認。")
+    lines.append("※ 外站票的中停天數、改票退票規定依票價條件而定，開票前請先看清楚。")
+    return "\n".join(lines)
+
+
+def send_telegram(token, chat_id, text):
+    chunks, cur = [], ""
+    for block in text.split("\n\n"):
+        if len(cur) + len(block) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += block + "\n\n"
+    chunks.append(cur)
+    for c in chunks:
+        if c.strip():
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat_id, "text": c,
+                                "disable_web_page_preview": "true"}, timeout=30)
 
 
 # ---------------- 主流程 ----------------
@@ -231,64 +373,10 @@ def months(n):
     return out
 
 
-def fmt(n):
-    return f"NT${n:,.0f}"
-
-
-def build_report(deals, cfg, names, run_date, scanned):
-    lines = [f"✈️ 外站票雷達 {run_date}",
-             f"掃描 {scanned} 條航線，找到 {len(deals)} 筆低於常見價 {cfg['deal_threshold_pct']}% 以上的票", ""]
-    if not deals:
-        lines.append("今天沒有特別便宜的票。")
-    for d in deals:
-        q = d.q
-        dep, ret = dt.date.fromisoformat(q.depart), dt.date.fromisoformat(q.ret)
-        lines.append(f"🔥 {names[q.origin]} {q.origin} → {names[q.dest]} {q.dest}（{d.region}）")
-        lines.append(f"  {dep:%m/%d}–{ret:%m/%d}（{q.days}天）｜{q.airline or '?'} 轉機 去{q.transfers_out}/回{q.transfers_back}")
-        lines.append(f"  票價 {fmt(q.price)}，比常見價 {fmt(d.baseline)} 便宜 {d.pct_below:.0f}%（基準：{d.baseline_src}）")
-        if d.total:
-            lines.append(f"  ＋台北⇄{names[q.origin]} 估 {fmt(d.positioning)} → 總計約 {fmt(d.total)}")
-        if d.tpe_price:
-            if d.total:
-                diff = d.tpe_price - d.total
-                word = "省" if diff > 0 else "反而貴"
-                lines.append(f"  台北出發同月最低 {fmt(d.tpe_price)} → {word} {fmt(abs(diff))}")
-            else:
-                lines.append(f"  台北出發同月最低 {fmt(d.tpe_price)}")
-        if d.live_price is not None or d.typical_range:
-            s = f"  Google Flights 即時：{fmt(d.live_price) if d.live_price else '查無'}"
-            if d.typical_range and len(d.typical_range) == 2:
-                s += f"（常見區間 {d.typical_range[0]:,}–{d.typical_range[1]:,}"
-                s += f"，{d.price_level}）" if d.price_level else "）"
-            lines.append(s)
-        for n in d.notes:
-            lines.append(f"  💡 {n}")
-        if q.link:
-            lines.append(f"  {q.link}")
-        lines.append("")
-    lines.append("※ 掃描價格為快取價，訂票前請以航空公司官網為準。外站多段票請到官網用「多個城市」組合查詢。")
-    return "\n".join(lines)
-
-
-def send_telegram(token, chat_id, text):
-    chunks, cur = [], ""
-    for block in text.split("\n\n"):
-        if len(cur) + len(block) > 3800:
-            chunks.append(cur)
-            cur = ""
-        cur += block + "\n\n"
-    chunks.append(cur)
-    for c in chunks:
-        if c.strip():
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          data={"chat_id": chat_id, "text": c, "disable_web_page_preview": "true"},
-                          timeout=30)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(BASE / "config.yaml"))
-    ap.add_argument("--demo", action="store_true", help="用假資料試跑")
+    ap.add_argument("--demo", action="store_true")
     ap.add_argument("--no-notify", action="store_true")
     args = ap.parse_args()
 
@@ -298,9 +386,11 @@ def main():
     run_date = dt.datetime.now(TW).date().isoformat()
     mlist = months(cfg.get("months_ahead", 6))
     tmin, tmax = cfg["trip_days"]["min"], cfg["trip_days"]["max"]
-    delay = cfg.get("request_delay_sec", 0.4)
+    delay = cfg.get("request_delay_sec", 0.7)
+    st = cfg["stopover"]
+    carriers = list(cfg["stopover_carriers"])
 
-    names = {home: "台北", **cfg["origins"]}
+    names = {home: "台北", **cfg["outstations"], **cfg["stopover_carriers"]}
     region_of = {}
     for region, ds in cfg["destinations"].items():
         for code, name in ds.items():
@@ -308,53 +398,43 @@ def main():
             region_of[code] = region
 
     if args.demo:
-        fetch = fake_fetcher()
+        fake_rt, fake_ow, fake_mc = fake_sources()
         db_path = BASE / "data" / "demo.db"
         db_path.unlink(missing_ok=True)
-        token = "demo"
+        token, serp_key = "demo", "demo"
     else:
         token = os.environ.get("TP_TOKEN")
         if not token:
             sys.exit("請先設定環境變數 TP_TOKEN（Travelpayouts API token）")
-        fetch = None
+        serp_key = os.environ.get("SERPAPI_KEY")
         db_path = BASE / "data" / "prices.db"
     db = open_db(db_path)
 
-    def get(origin, dest, month):
-        if args.demo:
-            return fetch(token, origin, dest, month, cur, delay, region_of.get(dest))
-        return fetch_travelpayouts(token, origin, dest, month, cur, delay)
-
-    # 1) 台北⇄外站 的估算成本（每月最低）
-    positioning = {}
-    for o in cfg["origins"]:
+    # ---- 第一階段：台北 ⇄ 目的地 直飛來回 ----
+    batches, skipped = {}, []
+    for dcode in region_of:
+        qs = []
         for m in mlist:
-            qs = [q for q in get(home, o, m) if q.days >= 3]
-            if qs:
-                positioning[(o, m)] = min(q.price for q in qs)
-    log(f"台北⇄外站成本：取得 {len(positioning)} 筆")
-
-    # 2) 掃描所有航線（外站起點 + 台北，用來比價）
-    batches = {}
-    for o in list(cfg["origins"]) + [home]:
-        for dcode in region_of:
-            qs = []
-            for m in mlist:
-                qs += get(o, dcode, m)
-            qs = [q for q in qs if tmin <= q.days <= tmax]
-            batches[(o, dcode)] = qs
-            if qs:
-                save_quotes(db, run_date, qs)
-            log(f"{o}->{dcode}: {len(qs)} 筆")
+            qs += (fake_rt(token, home, dcode, m, cur, delay, region=region_of[dcode])
+                   if args.demo else
+                   tp_roundtrips(token, home, dcode, m, cur, delay, direct=True))
+        qs = [q for q in qs if tmin <= q.days <= tmax]
+        if not qs:
+            skipped.append(dcode)
+            log(f"{home}->{dcode}: 查無直飛，略過")
+            continue
+        batches[dcode] = qs
+        db.execute("DELETE FROM tpe_direct WHERE run_date=? AND dest=?", (run_date, dcode))
+        db.executemany("INSERT INTO tpe_direct VALUES(?,?,?,?,?,?)",
+                       [(run_date, q.dest, q.depart, q.ret, q.price, q.airline) for q in qs])
+        log(f"{home}->{dcode}: {len(qs)} 筆直飛")
     db.commit()
 
-    # 3) 找好價
+    # ---- 挑候選 ----
     thr = cfg["deal_threshold_pct"] / 100
-    deals = []
-    for (o, dcode), qs in batches.items():
-        if o == home or not qs:
-            continue
-        base, src = baseline_for(db, o, dcode, run_date, cfg["baseline_window_days"],
+    candidates = []
+    for dcode, qs in batches.items():
+        base, src = baseline_for(db, dcode, run_date, cfg["baseline_window_days"],
                                  cfg["min_samples"], qs)
         if not base:
             continue
@@ -363,46 +443,85 @@ def main():
             if q.price <= base * (1 - thr):
                 if q.month not in best_per_month or q.price < best_per_month[q.month].price:
                     best_per_month[q.month] = q
-        tpe = batches.get((home, dcode), [])
         for q in best_per_month.values():
-            d = Deal(q, region_of[dcode], base, src)
-            d.positioning = positioning.get((o, q.month))
-            same_month = [t.price for t in tpe if t.month == q.month]
-            d.tpe_price = min(same_month) if same_month else None
-            if q.airline in cfg.get("taiwan_carriers", []):
-                d.notes.append(f"{q.airline} 是台灣籍航空，這張很可能經台北轉機（典型外站票，可考慮在台北停留）")
-            deals.append(d)
+            candidates.append(Candidate(q, region_of[dcode], base, src))
+    candidates.sort(key=lambda c: -c.pct_below)
+    candidates = candidates[: cfg.get("max_deals_in_report", 12)]
+    log(f"候選 {len(candidates)} 筆")
 
-    # 4) 去掉已通知過的
-    fresh = []
-    for d in deals:
-        key = f"{d.q.origin}-{d.q.dest}-{d.q.depart}-{d.q.ret}-{round(d.q.price, -2):.0f}"
-        if db.execute("SELECT 1 FROM notified WHERE key=?", (key,)).fetchone():
-            continue
-        fresh.append((key, d))
-    fresh.sort(key=lambda kd: -kd[1].pct_below)
-    fresh = fresh[: cfg.get("max_deals_in_report", 15)]
+    # ---- 第二階段：四腿票實際報價 ----
+    four_legs = []
+    mc_cfg = cfg.get("multicity", {})
+    has_serp = bool(serp_key)
+    if mc_cfg.get("enabled") and has_serp and candidates:
+        budget = mc_cfg.get("max_per_run", 3)
+        pos_cache = {}
+        for cand in candidates:
+            if budget <= 0:
+                break
+            d2 = dt.date.fromisoformat(cand.q.depart)
+            d3 = dt.date.fromisoformat(cand.q.ret)
+            d1 = d2 - dt.timedelta(days=st["days_before"])
+            d4 = d3 + dt.timedelta(days=st["days_after"])
+            if d1 <= dt.datetime.now(TW).date():
+                continue
+            for o in cfg["outstations"]:
+                if budget <= 0:
+                    break
+                budget -= 1
+                legs = [(o, home, d1.isoformat()),
+                        (home, cand.q.dest, d2.isoformat()),
+                        (cand.q.dest, home, d3.isoformat()),
+                        (home, o, d4.isoformat())]
+                if args.demo:
+                    price, airlines, nonstop, err = fake_mc(
+                        serp_key, legs, carriers, mc_cfg.get("nonstop_only", True), cur,
+                        cand.q.price)
+                else:
+                    price, airlines, nonstop, err = serp_multicity(
+                        serp_key, legs, carriers, mc_cfg.get("nonstop_only", True), cur)
+                    time.sleep(delay)
+                f = FourLeg(cand, o, [d1.isoformat(), d2.isoformat(),
+                                      d3.isoformat(), d4.isoformat()],
+                            price, airlines, nonstop, None, err)
+                if price is not None:
+                    key = (o, d1.strftime("%Y-%m"))
+                    if key not in pos_cache:
+                        pos_cache[key] = (fake_ow(token, home, o, key[1], cur, delay)
+                                          if args.demo else
+                                          tp_oneway_min(token, home, o, key[1], cur, delay))
+                    f.positioning = pos_cache[key]
+                    db.execute("INSERT INTO fourleg VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                               (run_date, o, cand.q.dest, *f.dates, price,
+                                ",".join(airlines), cand.q.price, f.positioning))
+                four_legs.append(f)
+                log(f"四腿 {o}->{cand.q.dest}: {price if price else err}")
+        db.commit()
+        four_legs.sort(key=lambda f: (f.saving is None, -(f.saving or 0)))
 
-    # 5) 即時複查
-    serp_key = os.environ.get("SERPAPI_KEY")
-    if cfg.get("verify", {}).get("enabled") and serp_key and not args.demo:
-        for _, d in fresh[: cfg["verify"].get("max_per_run", 3)]:
-            serpapi_verify(serp_key, d, cur)
-
-    report = build_report([d for _, d in fresh], cfg, names, run_date, len(batches))
+    report = build_report(cfg, names, run_date, four_legs, candidates,
+                          skipped, len(batches), has_serp)
     out = BASE / "reports"
     out.mkdir(exist_ok=True)
     (out / ("demo.md" if args.demo else "latest.md")).write_text(report, encoding="utf-8")
     print(report)
 
     tg_token, tg_chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not args.demo and not args.no_notify and tg_token and tg_chat and fresh:
-        send_telegram(tg_token, tg_chat, report)
-        log("已推播到 Telegram")
+    if not args.demo and not args.no_notify and tg_token and tg_chat:
+        fresh = [f for f in four_legs if f.saving and f.saving > 0]
+        new = []
+        for f in fresh:
+            k = f"{f.outstation}-{f.cand.q.dest}-{'-'.join(f.dates)}-{round(f.price, -2):.0f}"
+            if not db.execute("SELECT 1 FROM notified WHERE key=?", (k,)).fetchone():
+                new.append(k)
+        if new:
+            send_telegram(tg_token, tg_chat, report)
+            db.executemany("INSERT OR IGNORE INTO notified VALUES(?,?)",
+                           [(k, run_date) for k in new])
+            log(f"已推播到 Telegram（{len(new)} 筆新的）")
 
     if not args.demo:
-        db.executemany("INSERT OR IGNORE INTO notified VALUES(?,?)", [(k, run_date) for k, _ in fresh])
-        db.execute("DELETE FROM quotes WHERE run_date < ?",
+        db.execute("DELETE FROM tpe_direct WHERE run_date < ?",
                    ((dt.date.fromisoformat(run_date) - dt.timedelta(days=180)).isoformat(),))
         db.commit()
 
