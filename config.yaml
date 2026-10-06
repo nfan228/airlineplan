@@ -74,7 +74,7 @@ request_delay_sec: 0.7
 
 # 省多少錢以上才推播通知。設 0 代表只要有省就通知（會很吵）。
 # 建議設 3000～5000：低於這個數字，光是飛去外站的住宿和時間成本就吃掉了。
-notify_min_saving: 3000
+notify_min_saving: 0
 
 # 外站來回票實際報價（Google Flights，需要 SERPAPI_KEY）
 multicity:
