@@ -55,11 +55,13 @@ destinations:
     BNE: 布里斯本
     SYD: 雪梨
 
-# 第一階段的資料抓取方式
-# Travelpayouts 的快取資料裡標記為「直飛」的筆數很少，開 direct_only 會讓資料幾乎抓不到。
-# 所以預設是全抓，再用「只留台灣籍航空」來過濾——因為能中停台北的本來就只有這幾家。
+# 第一階段的資料抓取方式。兩個過濾都預設關閉，原因：
+#   direct_only：Travelpayouts 快取裡標記為「直飛」的筆數極少，開了資料幾乎抓不到。
+#   require_taiwan_carrier：它每組日期只回傳最便宜的那一家，台北飛歐美最便宜的
+#     幾乎都是外籍轉機票，開了會把 20 個目的地的資料全部濾掉。
+# 航空公司的限制放在第二階段用 Google Flights 執行，那裡才過濾得準。
 direct_only: false
-require_taiwan_carrier: true
+require_taiwan_carrier: false
 
 deal_threshold_pct: 12   # 台北來回票比常見價便宜多少 % 才列為候選
 baseline_window_days: 60
@@ -70,8 +72,11 @@ fallback_to_cheapest: true
 max_deals_in_report: 12
 request_delay_sec: 0.7
 
-# 四腿票實際報價（Google Flights 多段查詢，需要 SERPAPI_KEY）
+# 外站來回票實際報價（Google Flights，需要 SERPAPI_KEY）
 multicity:
   enabled: true
   max_per_run: 6         # 每次執行最多查幾組。SerpApi 免費額度每月 250 次，一天 6 組＝每月 180 次
-  nonstop_only: true     # 四段全部只要直飛
+  # 要不要額外查「拆成四段單程」的價格當參考。
+  # Google 會分段計價再加總，通常比一張外站來回票貴一倍以上，而且每查一次就多吃一次額度。
+  # 想親眼確認「不能拆開買」才打開它。
+  four_leg_check: false
